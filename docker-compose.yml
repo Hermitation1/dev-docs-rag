@@ -1,0 +1,128 @@
+name: dev-docs-rag
+
+x-app-common: &app-common
+  build: .
+  image: dev-docs-rag:local
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-devdocs}:${POSTGRES_PASSWORD:-devdocs}@db:5432/${POSTGRES_DB:-devdocs}
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-devdocs}:${RABBITMQ_PASSWORD:-devdocs}@rabbitmq:5672//
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    KNOWLEDGE_DIR: /app/knowledge
+    EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+    EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+    EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+    CHUNK_MAX_TOKENS: ${CHUNK_MAX_TOKENS:-600}
+    SEARCH_TOP_K: ${SEARCH_TOP_K:-5}
+    SEARCH_MAX_TOP_K: ${SEARCH_MAX_TOP_K:-20}
+    SEARCH_CANDIDATES: ${SEARCH_CANDIDATES:-30}
+    RRF_K: ${RRF_K:-60}
+    CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
+    GIT_CLONE_TIMEOUT_SECONDS: ${GIT_CLONE_TIMEOUT_SECONDS:-300}
+    INGESTION_MAX_RETRIES: ${INGESTION_MAX_RETRIES:-3}
+    FASTEMBED_CACHE_PATH: /models
+  volumes:
+    - models:/models
+    - ./knowledge:/app/knowledge
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-devdocs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devdocs}
+      POSTGRES_DB: ${POSTGRES_DB:-devdocs}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-devdocs} -d ${POSTGRES_DB:-devdocs}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-devdocs}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-devdocs}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    <<: *app-common
+    command: alembic upgrade head
+    depends_on:
+      db:
+        condition: service_healthy
+
+  topology:
+    <<: *app-common
+    command: python -m dev_docs_rag.worker.topology
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  api:
+    <<: *app-common
+    command: uvicorn dev_docs_rag.api.app:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topology:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    <<: *app-common
+    command: celery -A dev_docs_rag.worker.celery_app worker -Q index_file --loglevel=INFO --concurrency=2
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topology:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  models:

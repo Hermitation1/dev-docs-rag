@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: devdocs
+          POSTGRES_PASSWORD: devdocs
+          POSTGRES_DB: devdocs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U devdocs -d devdocs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: devdocs
+          RABBITMQ_DEFAULT_PASS: devdocs
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://devdocs:devdocs@localhost:5432/devdocs
+      REDIS_URL: redis://localhost:6379/15
+      CELERY_BROKER_URL: amqp://devdocs:devdocs@localhost:5672//
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: >-
+          uv run --frozen pytest -m "unit or integration"
+          --cov=src --cov-report=term-missing --cov-fail-under=80
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dev-docs-rag:ci .
